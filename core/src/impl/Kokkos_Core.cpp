@@ -126,6 +126,8 @@ int get_device_count() {
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
   // FIXME_NEXTSILICON: Need NextAPI support for querying the number of devices
   return 1;
+#elif defined(KOKKOS_ENABLE_METAL)
+  return 1;
 #else
   Kokkos::abort("implementation bug");
   return -1;

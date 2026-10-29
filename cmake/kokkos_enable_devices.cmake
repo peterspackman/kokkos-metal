@@ -99,3 +99,5 @@ if(KOKKOS_ENABLE_SYCL)
 endif()
 
 kokkos_device_option(NEXTSILICON OFF DEVICE "Whether to build NextSilicon backend")
+
+kokkos_device_option(METAL OFF DEVICE "Whether to build the Metal backend (Apple GPUs)")

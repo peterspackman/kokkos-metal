@@ -45,6 +45,9 @@ namespace Impl {
 #elif defined(KOKKOS_ENABLE_SYCL) && defined(__SYCL_DEVICE_ONLY__)
 // FIXME_SYCL SYCL doesn't abort
 #define KOKKOS_IMPL_ABORT_NORETURN
+#elif defined(KOKKOS_ENABLE_METAL)
+// A Metal kernel flags the abort and returns; the next fence reports it.
+#define KOKKOS_IMPL_ABORT_NORETURN [[noreturn]]
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
 // NextSilicon aborts
 #define KOKKOS_IMPL_ABORT_NORETURN [[noreturn]]
@@ -67,7 +70,7 @@ namespace Impl {
 
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) ||     \
     defined(KOKKOS_ENABLE_SYCL) || defined(KOKKOS_ENABLE_OPENACC) || \
-    defined(KOKKOS_ENABLE_NEXTSILICON)
+    defined(KOKKOS_ENABLE_NEXTSILICON) || defined(KOKKOS_ENABLE_METAL)
 KOKKOS_IMPL_ABORT_NORETURN_DEVICE inline KOKKOS_IMPL_DEVICE_FUNCTION void
 device_abort(const char *const msg) {
 #if defined(KOKKOS_ENABLE_CUDA)
@@ -80,6 +83,9 @@ device_abort(const char *const msg) {
   printf("%s", msg);  // FIXME_OPENACC
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
   ::Kokkos::Impl::nextsilicon_abort(msg);
+#elif defined(KOKKOS_ENABLE_METAL)
+  (void)msg;
+  __kmetal_abort();
 #else
 #error faulty logic
 #endif

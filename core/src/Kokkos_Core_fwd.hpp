@@ -95,6 +95,9 @@ using DefaultExecutionSpace KOKKOS_IMPL_DEFAULT_EXEC_SPACE_ANNOTATION =
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_NEXTSILICON)
 using DefaultExecutionSpace KOKKOS_IMPL_DEFAULT_EXEC_SPACE_ANNOTATION =
     Kokkos::Experimental::NextSilicon;
+#elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_METAL)
+using DefaultExecutionSpace KOKKOS_IMPL_DEFAULT_EXEC_SPACE_ANNOTATION =
+    Kokkos::Experimental::Metal;
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENMP)
 using DefaultExecutionSpace KOKKOS_IMPL_DEFAULT_EXEC_SPACE_ANNOTATION = OpenMP;
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_THREADS)
@@ -151,6 +154,9 @@ using SharedSpace               = SYCLSharedUSMSpace;
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
 using SharedSpace = Experimental::NextSiliconSharedSpace;
 #define KOKKOS_HAS_SHARED_SPACE
+#elif defined(KOKKOS_ENABLE_METAL)
+using SharedSpace = Experimental::MetalSharedSpace;
+#define KOKKOS_HAS_SHARED_SPACE
 // if only host compile point to HostSpace
 #elif !defined(KOKKOS_ENABLE_OPENACC)
 using SharedSpace = HostSpace;
@@ -172,6 +178,9 @@ using SharedHostPinnedSpace = HIPHostPinnedSpace;
 #define KOKKOS_HAS_SHARED_HOST_PINNED_SPACE
 #elif defined(KOKKOS_ENABLE_SYCL)
     using SharedHostPinnedSpace = SYCLHostUSMSpace;
+#define KOKKOS_HAS_SHARED_HOST_PINNED_SPACE
+#elif defined(KOKKOS_ENABLE_METAL)
+    using SharedHostPinnedSpace = Experimental::MetalSharedSpace;
 #define KOKKOS_HAS_SHARED_HOST_PINNED_SPACE
 #elif !defined(KOKKOS_ENABLE_OPENACC) && !defined(KOKKOS_ENABLE_NEXTSILICON)
     using SharedHostPinnedSpace = HostSpace;

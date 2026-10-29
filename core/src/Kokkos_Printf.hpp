@@ -30,10 +30,9 @@ KOKKOS_FORCEINLINE_FUNCTION void printf(const char* format, Args... args) {
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
   Impl::nextsilicon_printf(format, args...);
 #else
-  if constexpr (sizeof...(Args) == 0)
-    ::printf("%s", format);
-  else
-    ::printf(format, args...);
+  // Metal kernels cannot print.
+  KOKKOS_IF_ON_HOST((if constexpr (sizeof...(Args) == 0)::printf("%s", format);
+                     else ::printf(format, args...);))
 #endif
 }
 

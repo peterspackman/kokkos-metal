@@ -438,6 +438,7 @@
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_SYCL) ? 1 : 0) +        \
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENACC) ? 1 : 0) +     \
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_NEXTSILICON) ? 1 : 0) + \
+         (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_METAL) ? 1 : 0) +       \
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENMP) ? 1 : 0) +      \
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_THREADS) ? 1 : 0) +     \
          (defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_HPX) ? 1 : 0) +         \
@@ -453,6 +454,7 @@
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_SYCL)
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENACC)
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_NEXTSILICON)
+#elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_METAL)
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENMP)
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_THREADS)
 #elif defined(KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_HPX)
@@ -467,6 +469,8 @@
 #define KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENACC
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
 #define KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_NEXTSILICON
+#elif defined(KOKKOS_ENABLE_METAL)
+#define KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_METAL
 #elif defined(KOKKOS_ENABLE_OPENMP)
 #define KOKKOS_ENABLE_DEFAULT_DEVICE_TYPE_OPENMP
 #elif defined(KOKKOS_ENABLE_THREADS)
@@ -542,6 +546,22 @@
 #define KOKKOS_IF_ON_HOST(CODE)                                       \
   if (!::Kokkos::Impl::NextSiliconThreadSpaceGuard::is_on_device()) { \
     KOKKOS_IMPL_STRIP_PARENS(CODE)                                    \
+  }
+#endif
+
+#ifdef KOKKOS_ENABLE_METAL
+#include <Metal/Kokkos_Metal_Intrinsics.hpp>
+
+// Kernels are compiled from the host compiler's IR, so which side runs the
+// code is a call the kokkos-metal plugin folds to a constant on each side.
+// Constant evaluation takes the host branch without making the call.
+#define KOKKOS_IF_ON_DEVICE(CODE)                                   \
+  if (!__builtin_is_constant_evaluated() && __kmetal_is_device()) { \
+    KOKKOS_IMPL_STRIP_PARENS(CODE)                                  \
+  }
+#define KOKKOS_IF_ON_HOST(CODE)                                     \
+  if (__builtin_is_constant_evaluated() || !__kmetal_is_device()) { \
+    KOKKOS_IMPL_STRIP_PARENS(CODE)                                  \
   }
 #endif
 

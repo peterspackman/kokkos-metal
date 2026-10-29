@@ -92,6 +92,41 @@ if(KOKKOS_ENABLE_NEXTSILICON)
   append_glob(KOKKOS_CORE_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/NextSilicon/*.hpp)
 endif()
 
+if(KOKKOS_ENABLE_METAL)
+  append_glob(KOKKOS_CORE_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/Metal/*.cpp)
+  set(KOKKOS_METAL_RUNTIME_SRC ${CMAKE_CURRENT_SOURCE_DIR}/Metal/Kokkos_Metal_Runtime.mm)
+  list(APPEND KOKKOS_CORE_SRCS ${KOKKOS_METAL_RUNTIME_SRC})
+  set_source_files_properties(
+    ${KOKKOS_METAL_RUNTIME_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc"
+  )
+  append_glob(KOKKOS_CORE_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/Metal/*.hpp)
+
+  # The compiler plugin that turns kernels into Metal Shading Language. Every
+  # translation unit using Kokkos loads it, so it is built now, at configure
+  # time: as a build target, objects could compile before it was linked.
+  set(_kmetal_src ${CMAKE_CURRENT_SOURCE_DIR}/Metal/plugin)
+  set(_kmetal_bin ${CMAKE_BINARY_DIR}/kokkos-metal-plugin)
+  file(GLOB _kmetal_plugin_files ${_kmetal_src}/*.cpp ${_kmetal_src}/*.hpp ${_kmetal_src}/CMakeLists.txt)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_kmetal_plugin_files})
+  get_filename_component(_kmetal_cxx_dir ${CMAKE_CXX_COMPILER} DIRECTORY)
+  message(STATUS "Building the kokkos-metal compiler plugin in ${_kmetal_bin}")
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -S ${_kmetal_src} -B ${_kmetal_bin} -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER} -DCMAKE_C_COMPILER=${_kmetal_cxx_dir}/clang
+    RESULT_VARIABLE _kmetal_rc OUTPUT_VARIABLE _kmetal_out ERROR_VARIABLE _kmetal_out
+  )
+  if(_kmetal_rc EQUAL 0)
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} --build ${_kmetal_bin} RESULT_VARIABLE _kmetal_rc OUTPUT_VARIABLE _kmetal_out
+      ERROR_VARIABLE _kmetal_out
+    )
+  endif()
+  if(NOT _kmetal_rc EQUAL 0)
+    message(FATAL_ERROR "Building the kokkos-metal plugin failed:\n${_kmetal_out}")
+  endif()
+  set(KOKKOS_METAL_PLUGIN ${_kmetal_bin}/lib/libKokkosMetalPlugin.dylib)
+endif()
+
 if(NOT desul_FOUND)
   if(KOKKOS_ENABLE_CUDA)
     append_glob(KOKKOS_CORE_SRCS ${KOKKOS_SOURCE_DIR}/tpls/desul/src/Lock_Array_CUDA.cpp)
@@ -191,6 +226,18 @@ endif()
 kokkos_link_tpl(kokkoscore PUBLIC LIBQUADMATH)
 
 kokkos_link_tpl(kokkoscore PUBLIC NEXTAPI)
+
+if(KOKKOS_ENABLE_METAL)
+  target_link_libraries(
+    kokkoscore PUBLIC "-framework Metal" "-framework MetalPerformanceShaders" "-framework MetalPerformanceShadersGraph" "-framework Foundation"
+  )
+  # Every translation unit that uses Kokkos is compiled with the plugin, which
+  # extracts and registers its kernels.
+  target_compile_options(
+    kokkoscore PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fpass-plugin=$<BUILD_INTERFACE:${KOKKOS_METAL_PLUGIN}>$<INSTALL_INTERFACE:${CMAKE_INSTALL_FULL_LIBDIR}/libKokkosMetalPlugin.dylib>>
+  )
+  install(FILES ${KOKKOS_METAL_PLUGIN} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 if(desul_FOUND)
   target_link_libraries(kokkoscore PUBLIC desul_atomics)

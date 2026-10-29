@@ -28,6 +28,7 @@
 #cmakedefine KOKKOS_ENABLE_HPX
 #cmakedefine KOKKOS_ENABLE_SYCL
 #cmakedefine KOKKOS_ENABLE_NEXTSILICON
+#cmakedefine KOKKOS_ENABLE_METAL
 
 /* General Settings */
 #cmakedefine KOKKOS_ENABLE_CXX20

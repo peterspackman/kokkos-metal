@@ -35,6 +35,7 @@ enum struct DeviceType {
   SYCL,
   OpenACC,
   NextSilicon,
+  Metal,
   Unknown
 };
 
@@ -61,6 +62,7 @@ inline DeviceType devicetype_from_uint32t(const uint32_t in) {
     case 7: return DeviceType::SYCL;
     case 8: return DeviceType::OpenACC;
     case 9: return DeviceType::NextSilicon;
+    case 10: return DeviceType::Metal;
     default: return DeviceType::Unknown;  // TODO: error out?
   }
 }
