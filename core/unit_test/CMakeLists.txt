@@ -24,6 +24,9 @@ else()
   set(KOKKOS_OPENACC_FEATURE_LEVEL 17)
 endif()
 
+set(KOKKOS_METAL_FEATURE_LEVEL 999)
+set(KOKKOS_METAL_NAME Experimental::Metal)
+
 set(KOKKOS_NEXTSILICON_FEATURE_LEVEL 4)
 set(KOKKOS_NEXTSILICON_NAME Experimental::NextSilicon)
 
@@ -120,7 +123,7 @@ set(SMOKE_TEST_NAMES
     WorkGraph
 )
 
-foreach(Tag Threads;Serial;OpenMP;Cuda;HPX;OpenACC;HIP;SYCL;NextSilicon)
+foreach(Tag Threads;Serial;OpenMP;Cuda;HPX;OpenACC;HIP;SYCL;NextSilicon;Metal)
   string(TOUPPER ${Tag} DEVICE)
   string(TOLOWER ${Tag} dir)
 
@@ -822,6 +825,16 @@ if(Kokkos_ENABLE_SYCL)
       CoreUnitTest_SYCLInterOpGraph SOURCES UnitTestMainInit.cpp sycl/TestSYCL_InterOp_Graph.cpp
     )
   endif()
+endif()
+
+# Metal: one executable per test file, so that a test that aborts (launching a
+# kernel the plugin could not translate, one with 64-bit atomics say) does not
+# take the rest of the file's tests with it.
+if(Kokkos_ENABLE_METAL)
+  foreach(file IN LISTS Metal_SOURCES)
+    get_filename_component(name ${file} NAME_WE)
+    kokkos_add_executable_and_test(CoreUnitTest_${name} SOURCES UnitTestMainInit.cpp ${file})
+  endforeach()
 endif()
 
 # FIXME_NEXTSILICON: whitelist tests

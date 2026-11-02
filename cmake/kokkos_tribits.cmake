@@ -123,6 +123,9 @@ function(KOKKOS_ADD_EXECUTABLE_AND_TEST ROOT_NAME)
       OR Kokkos_ENABLE_EXPERIMENTAL_CXX20_MODULES
       OR Kokkos_ENABLE_SYCL
       OR Kokkos_ENABLE_HPX
+      # Homebrew clang on macOS: without RTTI a test cannot catch the
+      # library's std::runtime_error as std::exception.
+      OR Kokkos_ENABLE_METAL
       OR (KOKKOS_CXX_COMPILER_ID STREQUAL "NVIDIA" AND KOKKOS_CXX_HOST_COMPILER_ID STREQUAL "MSVC"))
   )
     if(MSVC)
