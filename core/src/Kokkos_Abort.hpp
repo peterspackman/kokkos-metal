@@ -84,8 +84,7 @@ device_abort(const char *const msg) {
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
   ::Kokkos::Impl::nextsilicon_abort(msg);
 #elif defined(KOKKOS_ENABLE_METAL)
-  (void)msg;
-  __kmetal_abort();
+  __kmetal_abort(msg);
 #else
 #error faulty logic
 #endif

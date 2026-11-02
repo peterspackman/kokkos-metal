@@ -253,13 +253,17 @@ std::vector<Kernel> compile_device(Module& M,
       k.source = "// " + demangle(e.fn->getName().str()) + "\n" + k.source;
       kernels.push_back(
           {e, name, std::move(k.source),
-           uint32_t(k.uses_threadgroup_memory) | uint32_t(k.uses_abort) << 1});
+           uint32_t(k.uses_threadgroup_memory) | uint32_t(k.uses_abort) << 1 |
+               uint32_t(k.uses_printf) << 3});
     } catch (const kmetal::Unsupported& err) {
       // Not an error yet: templates instantiate kernels that never run (a
       // View's copy kernel for a type the GPU cannot compute with). Launching
       // it is.
       std::string what = "kernel " + demangle(e.fn->getName().str()) +
                          " cannot run on the GPU: " + err.what();
+      if (const char* dump = getenv("KOKKOS_METAL_PLUGIN_DUMP");
+          dump && StringRef(dump) == "ir")
+        fn->print(errs());
       M.getContext().diagnose(
           DiagnosticInfoGeneric("kokkos-metal: " + what, DS_Warning));
       kernels.push_back({e, name, std::move(what), kUnsupported});

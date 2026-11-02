@@ -220,8 +220,8 @@ void metal_reduce_k(const Shape& shape, const FR& fr,
   const uint32_t groups =
       uint32_t(std::clamp<uint64_t>((n + threads - 1) / threads, 1, 1024));
 
-  char* scratch =
-      static_cast<char*>(metal_scratch(metal_align(groups * size) + size));
+  MetalScratch hold = metal_scratch(metal_align(groups * size) + size);
+  char* scratch     = hold.ptr;
   char* out = result_on_device && result ? reinterpret_cast<char*>(result)
                                          : scratch + metal_align(groups * size);
   metal_launch(Driver{fr, shape, scratch}, groups, threads, threads * size);
@@ -370,8 +370,8 @@ void metal_scan_k(const Shape& shape, const FR& fr,
   const uint64_t chunk = std::max<uint64_t>(
       1, (n + uint64_t(groups) * threads - 1) / (uint64_t(groups) * threads));
 
-  char* scratch =
-      static_cast<char*>(metal_scratch(metal_align(groups * size) + size));
+  MetalScratch hold = metal_scratch(metal_align(groups * size) + size);
+  char* scratch     = hold.ptr;
   char* out = total_on_device && total ? reinterpret_cast<char*>(total)
                                        : scratch + metal_align(groups * size);
   metal_launch(Up{fr, shape, scratch, chunk}, groups, threads, threads * size);

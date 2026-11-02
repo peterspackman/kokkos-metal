@@ -1164,6 +1164,10 @@ KOKKOS_INLINE_FUNCTION void parallel_reduce(
                 || std::is_same_v<typename TeamHandle::execution_space,
                                   Kokkos::SYCL>
 #endif
+#ifdef KOKKOS_ENABLE_METAL
+                || std::is_same_v<typename TeamHandle::execution_space,
+                                  Kokkos::Experimental::Metal>
+#endif
   )
     policy.team.vector_reduce(
         Kokkos::Sum<ReducerValueType, typename TeamHandle::execution_space>{
@@ -1199,6 +1203,10 @@ KOKKOS_INLINE_FUNCTION void parallel_reduce(
 #elif defined(KOKKOS_ENABLE_SYCL)
                 || std::is_same_v<typename TeamHandle::execution_space,
                                   Kokkos::SYCL>
+#endif
+#ifdef KOKKOS_ENABLE_METAL
+                || std::is_same_v<typename TeamHandle::execution_space,
+                                  Kokkos::Experimental::Metal>
 #endif
   )
     policy.team.vector_reduce(

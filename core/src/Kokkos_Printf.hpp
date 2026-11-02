@@ -13,6 +13,9 @@
 #else
 #include <cstdio>
 #endif
+#ifdef KOKKOS_ENABLE_METAL
+#include <Metal/Kokkos_Metal_Intrinsics.hpp>
+#endif
 
 namespace Kokkos {
 
@@ -30,9 +33,11 @@ KOKKOS_FORCEINLINE_FUNCTION void printf(const char* format, Args... args) {
 #elif defined(KOKKOS_ENABLE_NEXTSILICON)
   Impl::nextsilicon_printf(format, args...);
 #else
-  // Metal kernels cannot print.
   KOKKOS_IF_ON_HOST((if constexpr (sizeof...(Args) == 0)::printf("%s", format);
                      else ::printf(format, args...);))
+#ifdef KOKKOS_ENABLE_METAL
+  KOKKOS_IF_ON_DEVICE((Impl::MetalDevice::printf(format, args...);))
+#endif
 #endif
 }
 

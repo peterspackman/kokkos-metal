@@ -61,14 +61,25 @@ cmake --build build-metal && ctest --test-dir build-metal
   function pointers, virtual calls, calls into other translation units) warn
   when compiled and abort if launched.
 - One command queue: every instance of the execution space shares it.
-- Kokkos's own unit tests are not ported; `metal/` has the backend's tests.
+- Nothing in a kernel may wait for another thread: a SIMD group runs in
+  lockstep, and a kernel that spins forever can wedge the GPU past the death of
+  its process. `UniqueToken` and `WorkGraphPolicy` abort rather than wait long.
+- Of Kokkos's core unit tests (`-DKokkos_ENABLE_TESTS=ON`, each test in its
+  own process), 433 pass, 19 skip and 34 do not: 18 use 64-bit atomics, 14
+  check double-precision maths to more digits than float gives, one wants
+  8 KB reduction values with vector length 4, and one expects a fence that
+  unified memory does not need. The UniqueToken and WorkGraphPolicy tests are
+  not run (see above). `metal/` has the backend's own tests.
 
 ## Debugging
+
+`Kokkos::printf` works in kernels; the output appears at the next fence.
 
 | Variable | |
 |---|---|
 | `KOKKOS_METAL_DUMP=dir` | write each kernel's MSL to `dir` as it is compiled |
 | `KOKKOS_METAL_PLUGIN_DUMP=1` | (at compile time) print the MSL of every kernel |
+| `KOKKOS_METAL_PLUGIN_DUMP=ir` | (at compile time) print the LLVM IR of kernels the plugin cannot translate |
 | `KOKKOS_METAL_STATS=1` | per-kernel GPU times at exit (serialises the kernels) |
 | `KOKKOS_METAL_BUSY=1` | GPU-busy against wall time at exit |
 | `KOKKOS_METAL_NANCHECK=1` | report kernels that write NaNs (slow) |

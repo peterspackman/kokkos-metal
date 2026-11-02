@@ -20,6 +20,7 @@ static_assert(false,
 
 #include <cstdint>
 #include <iosfwd>
+#include <mutex>
 #include <string>
 #include <type_traits>
 
@@ -50,7 +51,15 @@ class Metal {
 
   static constexpr const char* name() { return "Metal"; }
   // Threads the GPU keeps in flight: what UniqueToken and friends size for.
-  static int concurrency();
+  KOKKOS_INLINE_FUNCTION static int concurrency() { return 64 * 1024; }
+  static int impl_max_hardware_threads() { return concurrency(); }
+  // The thread's index in the grid, folded below concurrency().
+  KOKKOS_INLINE_FUNCTION static int impl_hardware_thread_id() noexcept {
+    int id = 0;
+    KOKKOS_IF_ON_DEVICE(
+        (id = int(__kmetal_thread_position_in_grid(0) % concurrency());))
+    return id;
+  }
   uint32_t impl_instance_id() const noexcept { return 1; }
 
   friend bool operator==(Metal const&, Metal const&) { return true; }
@@ -79,9 +88,17 @@ struct MemorySpaceAccess<Kokkos::Experimental::MetalSpace,
   enum : bool { accessible = true };
 };
 
-// Device memory for a kernel's own bookkeeping (reduction partials), reused
-// from launch to launch; kernels run in order, so one buffer suffices.
-void* metal_scratch(size_t bytes);
+// Device memory for a parallel operation's own bookkeeping (reduction
+// partials), reused from launch to launch. The operation holds it from its
+// first kernel to its last read of it: kernels run in the order they were
+// enqueued, so another host thread's kernels using it come after.
+struct MetalScratch {
+  std::unique_lock<std::mutex> lock;
+  char* ptr = nullptr;
+};
+MetalScratch metal_scratch(size_t bytes);
+// Level-1 team scratch, held likewise.
+MetalScratch metal_team_scratch(size_t bytes);
 
 // Enqueue Driver::metal_run() over `groups` threadgroups of `threads`.
 template <class Driver>

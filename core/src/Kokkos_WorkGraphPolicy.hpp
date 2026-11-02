@@ -230,4 +230,8 @@ class WorkGraphPolicy : public Kokkos::Impl::PolicyTraits<Properties...> {
 #include "HPX/Kokkos_HPX_WorkGraphPolicy.hpp"
 #endif
 
+#ifdef KOKKOS_ENABLE_METAL
+#include "Metal/Kokkos_Metal_WorkGraphPolicy.hpp"
+#endif
+
 #endif /* #define KOKKOS_WORKGRAPHPOLICY_HPP */

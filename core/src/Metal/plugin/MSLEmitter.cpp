@@ -74,20 +74,41 @@ std::string precise(const std::string& f) {
       "sqrt",  "rsqrt", "sin",  "cos",   "tan",  "asin",  "acos",
       "atan",  "atan2", "sinh", "cosh",  "tanh", "asinh", "acosh",
       "atanh", "exp",   "exp2", "exp10", "log",  "log2",  "log10",
-      "pow",   "fmod",  "cbrt", "ldexp"};
+      "pow",   "fmod",  "ldexp"};
   return names.count(f) ? "precise::" + f : f;
 }
 
-// The unsigned MSL type an integer is held in, and its signed twin.
+// The unsigned MSL type an integer is held in, and its signed twin. The
+// optimizer makes integers of other widths (i33 for n(n-1)/2 of an i32, say):
+// they live zero-extended in the next wider type, and km_u128 past 64 bits.
 std::string int_type(unsigned bits, bool is_signed = false) {
-  switch (bits) {
-    case 1: return "bool";
-    case 8: return is_signed ? "char" : "uchar";
-    case 16: return is_signed ? "short" : "ushort";
-    case 32: return is_signed ? "int" : "uint";
-    case 64: return is_signed ? "long" : "ulong";
-  }
+  if (bits == 1) return "bool";
+  if (bits <= 8) return is_signed ? "char" : "uchar";
+  if (bits <= 16) return is_signed ? "short" : "ushort";
+  if (bits <= 32) return is_signed ? "int" : "uint";
+  if (bits <= 64) return is_signed ? "long" : "ulong";
+  if (bits <= 128) return "km_u128";
   unsupported("integers of " + Twine(bits) + " bits");
+}
+
+// Whether integers of this width are held in a wider type.
+bool odd_width(unsigned bits) {
+  return bits != 1 && bits != 8 && bits != 16 && bits != 32 && bits != 64;
+}
+
+// The width of the type an integer of this width is held in.
+unsigned container_width(unsigned bits) {
+  return bits <= 8 ? 8 : bits <= 16 ? 16 : bits <= 32 ? 32 : bits <= 64 ? 64 : 128;
+}
+
+// expr, an integer of the given width, with the container's bits above it
+// cleared.
+std::string fit(const std::string& expr, unsigned bits) {
+  if (!odd_width(bits)) return expr;
+  if (bits > 64) return "km_mask128(" + expr + ", " + std::to_string(bits) + ")";
+  uint64_t mask = (uint64_t(1) << bits) - 1;
+  return "(" + int_type(bits) + ")((" + expr + ") & " + std::to_string(mask) +
+         (bits > 32 ? "ul)" : "u)");
 }
 
 std::string float_type(Type* t) {
@@ -147,12 +168,13 @@ class Emitter {
       if (builtins.count(id)) out += std::string(",\n    ") + decl;
     if (uses_tg) out += ",\n    threadgroup uchar* __tgmem [[threadgroup(0)]]";
     if (uses_abort) out += ",\n    device atomic_uint* __abort [[buffer(1)]]";
+    if (uses_printf) out += ",\n    device uchar* __printf [[buffer(2)]]";
     out += ") {\n";
     out += decls_out;
     if (uses_jmp) out += "  int __jmp = 0;\n";
     out += body_out;
     out += "}\n";
-    return {out, uses_tg, uses_abort};
+    return {out, uses_tg, uses_abort, uses_printf};
   }
 
  private:
@@ -167,7 +189,8 @@ class Emitter {
   DenseMap<const Value*, std::string> names;
   DenseMap<const GlobalVariable*, std::string> global_names;
   std::set<std::string> builtins;
-  bool uses_jmp = false, uses_tg = false, uses_abort = false;
+  bool uses_jmp = false, uses_tg = false, uses_abort = false,
+       uses_printf = false;
   int next_value = 0;
 
   std::string globals_out, decls_out, body_out;
@@ -557,6 +580,12 @@ class Emitter {
     if (auto* ci = dyn_cast<ConstantInt>(v)) {
       unsigned bits = ci->getBitWidth();
       if (bits == 1) return ci->isOne() ? "true" : "false";
+      if (bits > 64) {
+        const APInt& x = ci->getValue();
+        return "km_u128(" + std::to_string(x.extractBitsAsZExtValue(64, 0)) +
+               "ul, " +
+               std::to_string(x.extractBitsAsZExtValue(bits - 64, 64)) + "ul)";
+      }
       std::string n = std::to_string(ci->getZExtValue());
       if (bits == 32) return n + "u";
       if (bits == 64) return n + "ul";
@@ -683,22 +712,38 @@ class Emitter {
         offset += ci->getSExtValue() * stride;
         continue;
       }
-      unsigned bits = idx->getType()->getIntegerBitWidth();
-      std::string i = "(long)(" + int_type(bits, true) + ")" + value(idx);
+      std::string i = "(long)" + signed_value(idx);
       terms += " + " + (stride == 1 ? i : i + " * " + std::to_string(stride));
     }
     if (offset) terms += " + (long)" + std::to_string(offset);
     return terms.empty() ? base : "(" + base + terms + ")";
   }
 
+  // An integer as its container's signed type, sign-extended from its width.
   std::string signed_value(const Value* v) {
-    return "(" + int_type(v->getType()->getIntegerBitWidth(), true) + ")" +
-           value(v);
+    unsigned bits = v->getType()->getIntegerBitWidth();
+    std::string S = int_type(bits, true);
+    if (bits > 64) unsupported("signed arithmetic on integers wider than 64 bits");
+    if (!odd_width(bits)) return "(" + S + ")" + value(v);
+    std::string k = std::to_string(container_width(bits) - bits);
+    return "((" + S + ")((" + S + ")(" + value(v) + " << " + k + ") >> " + k +
+           "))";
   }
 
   std::string memory(const Value* ptr, Type* t) {
     return std::string("(*(") + space_name(space_of(ptr)) + " " +
            memory_type(t) + "*)" + value(ptr) + ")";
+  }
+
+  static bool is_odd_int(Type* t) {
+    return t->isIntegerTy() && odd_width(t->getIntegerBitWidth()) &&
+           t->getIntegerBitWidth() <= 64;
+  }
+
+  // ptr as a byte pointer in its address space.
+  std::string bytes_of(const Value* ptr) {
+    return std::string("((") + space_name(space_of(ptr)) + " km_u8*)" +
+           value(ptr) + ")";
   }
 
   // --- instructions -------------------------------------------------------
@@ -724,6 +769,16 @@ class Emitter {
       return assign(inst, gep(cast<GEPOperator>(g)));
     if (auto* ld = dyn_cast<LoadInst>(&inst)) {
       if (ld->isAtomic()) return assign(inst, atomic_load(*ld));
+      if (is_odd_int(ld->getType())) {
+        // Byte by byte: an i24 is three bytes, with no MSL type of its own.
+        unsigned bytes = DL.getTypeStoreSize(ld->getType());
+        std::string p  = bytes_of(ld->getPointerOperand()), T = type_of(ld),
+                    e;
+        for (unsigned i = 0; i < bytes; ++i)
+          e += (i ? " | ((" : "((") + T + ")" + p + "[" + std::to_string(i) +
+               "] << " + std::to_string(8 * i) + ")";
+        return assign(inst, fit(e, ld->getType()->getIntegerBitWidth()));
+      }
       std::string m = memory(ld->getPointerOperand(), ld->getType());
       if (ld->getType()->isPointerTy()) m = "(" + type_of(ld) + ")" + m;
       return assign(inst, m);
@@ -734,6 +789,21 @@ class Emitter {
       if (v->getType()->isPointerTy()) val = "(ulong)" + val;
       if (st->isAtomic() && is_wide(v->getType())) {
         line(volatile_word(st->getPointerOperand()) + " = " + val + ";");
+        return;
+      }
+      if (is_odd_int(v->getType()) && !st->isAtomic()) {
+        unsigned bytes = DL.getTypeStoreSize(v->getType());
+        std::string p  = bytes_of(st->getPointerOperand());
+        for (unsigned i = 0; i < bytes; ++i)
+          line(p + "[" + std::to_string(i) + "] = (uchar)(" + val + " >> " +
+               std::to_string(8 * i) + ");");
+        return;
+      }
+      if (st->isAtomic() && is_narrow(v->getType())) {
+        auto [w, shift] = containing_word(st->getPointerOperand(), st);
+        line("km_atomic_rmw(" + w + ", " + shift + ", " +
+             std::to_string(v->getType()->getIntegerBitWidth()) +
+             ", KM_XCHG, (uint)" + val + ");");
         return;
       }
       if (st->isAtomic()) {
@@ -796,6 +866,27 @@ class Emitter {
       default: break;
     }
     unsigned bits = t->getIntegerBitWidth();
+    if (odd_width(bits)) return fit(integer_binary(bo), bits);
+    return integer_binary(bo);
+  }
+
+  std::string integer_binary(const BinaryOperator& bo) {
+    std::string a = value(bo.getOperand(0)), b = value(bo.getOperand(1));
+    unsigned bits = bo.getType()->getIntegerBitWidth();
+    if (bits > 64) {
+      switch (bo.getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Sub:
+        case Instruction::Mul:
+        case Instruction::Shl:
+        case Instruction::LShr:
+        case Instruction::And:
+        case Instruction::Or:
+        case Instruction::Xor: break;
+        default:
+          unsupported("this operation on integers wider than 64 bits", &bo);
+      }
+    }
     std::string T = int_type(bits), S = int_type(bits, true);
     if (bits == 1) {
       switch (bo.getOpcode()) {
@@ -826,11 +917,14 @@ class Emitter {
       case Instruction::URem: return a + " % " + b;
       case Instruction::LShr: return a + " >> " + b;
       case Instruction::SDiv:
-        return "(" + T + ")((" + S + ")" + a + " / (" + S + ")" + b + ")";
+        return "(" + T + ")(" + signed_value(bo.getOperand(0)) + " / " +
+               signed_value(bo.getOperand(1)) + ")";
       case Instruction::SRem:
-        return "(" + T + ")((" + S + ")" + a + " % (" + S + ")" + b + ")";
+        return "(" + T + ")(" + signed_value(bo.getOperand(0)) + " % " +
+               signed_value(bo.getOperand(1)) + ")";
       case Instruction::AShr:
-        return "(" + T + ")((" + S + ")" + a + " >> " + b + ")";
+        return "(" + T + ")(" + signed_value(bo.getOperand(0)) + " >> " + b +
+               ")";
       default: unsupported("binary operator", &bo);
     }
   }
@@ -933,6 +1027,24 @@ class Emitter {
       }
       unsupported("this double-precision conversion", &c);
     }
+    if (to->isIntegerTy() && odd_width(to->getIntegerBitWidth()))
+      return fit(integer_cast(c), to->getIntegerBitWidth());
+    return integer_cast(c);
+  }
+
+  std::string integer_cast(const CastInst& c) {
+    const Value* x = c.getOperand(0);
+    Type *from = x->getType(), *to = c.getType();
+    std::string a = value(x);
+    if ((from->isIntegerTy() && from->getIntegerBitWidth() > 64 &&
+         c.getOpcode() != Instruction::Trunc) ||
+        (to->isIntegerTy() && to->getIntegerBitWidth() > 64 &&
+         c.getOpcode() != Instruction::ZExt &&
+         c.getOpcode() != Instruction::SExt))
+      unsupported("this conversion of integers wider than 64 bits", &c);
+    if (to->isIntegerTy() && to->getIntegerBitWidth() > 64 &&
+        c.getOpcode() == Instruction::SExt)
+      return "km_sext128((long)" + signed_value(x) + ")";
     switch (c.getOpcode()) {
       case Instruction::Trunc:
         if (to->isIntegerTy(1)) return "(bool)(" + a + " & 1)";
@@ -984,10 +1096,16 @@ class Emitter {
 
   std::string atomic_pointer(const Value* ptr, const std::string& type,
                              const Instruction* where) {
+    return atomic_pointer_expr(ptr, type, value(ptr), where);
+  }
+
+  std::string atomic_pointer_expr(const Value* ptr, const std::string& type,
+                                  const std::string& p,
+                                  const Instruction* where) {
     Space s = space_of(ptr);
     if (s != Space::Device && s != Space::Threadgroup)
       unsupported(Twine("an atomic on ") + space_name(s) + " memory", where);
-    return std::string("(") + space_name(s) + " " + type + "*)" + value(ptr);
+    return std::string("(") + space_name(s) + " " + type + "*)" + p;
   }
 
   static bool is_wide(Type* t) {
@@ -1000,7 +1118,25 @@ class Emitter {
            " volatile ulong*)" + value(ptr) + ")";
   }
 
+  static bool is_narrow(Type* t) {
+    return t->isIntegerTy(8) || t->isIntegerTy(16);
+  }
+
+  // The aligned 32-bit word holding the 8- or 16-bit integer at ptr, and the
+  // position of the integer in it.
+  std::pair<std::string, std::string> containing_word(
+      const Value* ptr, const Instruction* where) {
+    std::string p = value(ptr), w = "((" + p + ") - ((ulong)(" + p + ") & 3))";
+    return {atomic_pointer_expr(ptr, "atomic_uint", w, where),
+            "(uint)((ulong)(" + p + ") & 3) * 8"};
+  }
+
   std::string atomic_load(const LoadInst& ld) {
+    if (is_narrow(ld.getType())) {
+      auto [w, shift] = containing_word(ld.getPointerOperand(), &ld);
+      return "(" + type_of(&ld) + ")(atomic_load_explicit(" + w +
+             ", memory_order_relaxed) >> " + shift + ")";
+    }
     if (is_wide(ld.getType()))
       return ld.getType()->isPointerTy()
                  ? "(" + type_of(&ld) + ")" +
@@ -1012,10 +1148,36 @@ class Emitter {
            ", memory_order_relaxed)";
   }
 
+  // An atomicrmw Metal has no instruction for, as a CAS loop.
+  std::string emulated_rmw(const AtomicRMWInst& rmw) {
+    static const std::map<AtomicRMWInst::BinOp, const char*> ops = {
+        {AtomicRMWInst::Xchg, "KM_XCHG"}, {AtomicRMWInst::Add, "KM_ADD"},
+        {AtomicRMWInst::Sub, "KM_SUB"},   {AtomicRMWInst::And, "KM_AND"},
+        {AtomicRMWInst::Or, "KM_OR"},     {AtomicRMWInst::Xor, "KM_XOR"},
+        {AtomicRMWInst::Nand, "KM_NAND"}, {AtomicRMWInst::Max, "KM_MAX"},
+        {AtomicRMWInst::Min, "KM_MIN"},   {AtomicRMWInst::UMax, "KM_UMAX"},
+        {AtomicRMWInst::UMin, "KM_UMIN"}};
+    auto it = ops.find(rmw.getOperation());
+    if (it == ops.end()) unsupported("atomicrmw operation", &rmw);
+    Type* t       = rmw.getType();
+    unsigned bits = t->getIntegerBitWidth();
+    std::string v = "(uint)" + value(rmw.getValOperand());
+    if (bits == 32)
+      return "km_atomic_rmw(" +
+             atomic_pointer(rmw.getPointerOperand(), "atomic_uint", &rmw) +
+             ", 0, 32, " + it->second + ", " + v + ")";
+    auto [w, shift] = containing_word(rmw.getPointerOperand(), &rmw);
+    return "(" + scalar_type(t) + ")km_atomic_rmw(" + w + ", " + shift + ", " +
+           std::to_string(bits) + ", " + it->second + ", " + v + ")";
+  }
+
   std::string atomic_rmw(const AtomicRMWInst& rmw) {
     Type* t       = rmw.getType();
     std::string v = value(rmw.getValOperand());
     auto op       = rmw.getOperation();
+    if (is_narrow(t) ||
+        (t->isIntegerTy(32) && op == AtomicRMWInst::Nand))
+      return emulated_rmw(rmw);
     if (is_wide(t) && op != AtomicRMWInst::UMax && op != AtomicRMWInst::UMin)
       unsupported(
           "a 64-bit atomic other than unsigned min/max (Metal has no 64-bit "
@@ -1059,6 +1221,14 @@ class Emitter {
   void emit_cmpxchg(const AtomicCmpXchgInst& cx) {
     Type* t              = cx.getCompareOperand()->getType();
     const std::string& n = names[&cx];
+    if (is_narrow(t)) {
+      auto [w, shift] = containing_word(cx.getPointerOperand(), &cx);
+      line(n + "_0 = (" + scalar_type(t) + ")km_cas_narrow(" + w + ", " +
+           shift + ", " + std::to_string(t->getIntegerBitWidth()) + ", (uint)" +
+           value(cx.getCompareOperand()) + ", (uint)" +
+           value(cx.getNewValOperand()) + ", " + n + "_1);");
+      return;
+    }
     if (!t->isIntegerTy(32))
       unsupported(
           "compare-and-swap on anything but 32-bit words (Metal has no 64-bit "
@@ -1095,13 +1265,9 @@ class Emitter {
     StringRef name = fn->getName();
     if (fn->isIntrinsic()) return emit_intrinsic(c, fn->getIntrinsicID());
     if (name.starts_with("__kmetal_")) return emit_kmetal(c, name);
-    if (c.getType()->isDoubleTy() && emit_double(c, name)) return;
-    if (std::string m = libm(name); !m.empty()) {
-      std::string args;
-      for (unsigned i = 0; i < c.arg_size(); ++i)
-        args += (i ? ", " : "") + arg(c, i);
-      return assign(c, m + "(" + args + ")");
-    }
+    if (emit_libm(c, name)) return;
+    // long double is double on arm64: asinhl is asinh.
+    if (name.ends_with("l") && emit_libm(c, name.drop_back())) return;
     unsupported("a call to '" + demangled(name) +
                     "', whose body is not visible here. Functions called on "
                     "the GPU must be "
@@ -1110,10 +1276,62 @@ class Emitter {
                 &c);
   }
 
+  bool emit_libm(const CallInst& c, StringRef name) {
+    bool dbl = c.getType()->isDoubleTy() ||
+               (c.arg_size() && c.getArgOperand(0)->getType()->isDoubleTy());
+    if (dbl && emit_double(c, name)) return true;
+    if (!dbl && emit_float_extra(c, name)) return true;
+    if (std::string m = libm(name); !m.empty()) {
+      std::string args;
+      for (unsigned i = 0; i < c.arg_size(); ++i)
+        args += (i ? ", " : "") + arg(c, i);
+      assign(c, m + "(" + args + ")");
+      return true;
+    }
+    return false;
+  }
+
+  // An int result of a libm function, returned through its pointer argument.
+  void store_int(const CallInst& c, unsigned i, const std::string& v) {
+    line(memory(c.getArgOperand(i), Type::getInt32Ty(c.getContext())) +
+         " = (uint)" + v + ";");
+  }
+
+  // The float functions that return more than a value, or take or return an
+  // int, or that MSL lacks.
+  bool emit_float_extra(const CallInst& c, StringRef f) {
+    const std::string& n = names[&c];
+    std::string x = c.arg_size() ? arg(c, 0) : "";
+    if (f == "frexpf") {
+      line("{ int e; " + n + " = frexp(" + x + ", e);");
+      store_int(c, 1, "e");
+      line("}");
+      return true;
+    }
+    if (f == "remquof") {
+      line("{ int q; " + n + " = km_remquo(" + x + ", " + arg(c, 1) + ", q);");
+      store_int(c, 2, "q");
+      line("}");
+      return true;
+    }
+    if (f == "modff") {
+      line("{ float i; " + n + " = modf(" + x + ", i); " +
+           memory(c.getArgOperand(1), c.getType()) + " = i; }");
+      return true;
+    }
+    if (f == "ilogbf") return assign(c, "(uint)km_ilogb(" + x + ")"), true;
+    if (f == "scalbnf" || f == "scalblnf")
+      return assign(c, "ldexp(" + x + ", (int)clamp((long)" +
+                           signed_value(c.getArgOperand(1)) +
+                           ", -100000l, 100000l))"),
+             true;
+    return false;
+  }
+
   static std::string libm(StringRef name) {
     static const std::map<std::string, std::string, std::less<>> table = {
         {"sqrtf", "sqrt"},
-        {"cbrtf", "cbrt"},
+        {"cbrtf", "km_cbrt"},
         {"expf", "exp"},
         {"exp2f", "exp2"},
         {"exp10f", "exp10"},
@@ -1153,6 +1371,10 @@ class Emitter {
         {"erfcf", "km_erfc"},
         {"fdimf", "fdim"},
         {"remainderf", "km_remainder"},
+        {"logbf", "km_logb"},
+        {"nextafterf", "km_nextafter"},
+        {"tgammaf", "km_tgamma"},
+        {"lgammaf", "km_lgamma"},
     };
     auto it = table.find(name);
     return it == table.end() ? std::string() : precise(it->second);
@@ -1198,10 +1420,12 @@ class Emitter {
       return assign(
           c, "simd_shuffle_up(" + arg(c, 0) + ", (ushort)" + arg(c, 1) + ")");
     if (name == "__kmetal_is_device") return assign(c, "true");
+    if (name == "__kmetal_printf_buffer")
+      return uses_printf = true, assign(c, "__printf");
     if (name == "__kmetal_kernel_key") return;
     if (name == "__kmetal_abort") {
       uses_abort = true;
-      line("atomic_store_explicit(__abort, 1u, memory_order_relaxed);");
+      line("km_abort(__abort, " + arg(c, 0) + ");");
       return line("return;");
     }
     unsupported("unknown Metal intrinsic " + name, &c);
@@ -1221,13 +1445,15 @@ class Emitter {
         {"fmax", "km_dmax"},       {"maxnum", "km_dmax"},
         {"maximum", "km_dmax"},    {"maximumnum", "km_dmax"},
         {"fma", "km_dfma"},        {"fmuladd", "km_dfma"},
+        {"nextafter", "km_dnextafter"}, {"logb", "km_dlogb"},
+        {"remainder", "km_dremainder"},
     };
     static const std::set<std::string, std::less<>> via_float = {
         "sin",   "cos",   "tan",   "asin",      "acos",  "atan",
         "atan2", "sinh",  "cosh",  "tanh",      "asinh", "acosh",
         "atanh", "exp",   "exp2",  "exp10",     "log",   "log2",
         "log10", "pow",   "cbrt",  "fmod",      "hypot", "erf",
-        "erfc",  "expm1", "log1p", "remainder", "fdim"};
+        "erfc",  "expm1", "log1p", "fdim",      "tgamma", "lgamma"};
     std::string args;
     if (auto it = exact.find(f); it != exact.end()) {
       for (unsigned i = 0; i < c.arg_size(); ++i)
@@ -1245,6 +1471,42 @@ class Emitter {
     if (f == "powi")
       return assign(c, "km_dpowi(" + arg(c, 0) + ", (int)" + arg(c, 1) + ")"),
              true;
+    const std::string& n = names[&c];
+    std::string x        = arg(c, 0);
+    if (f == "scalbn" || f == "scalbln")
+      return assign(c, "km_dldexp(" + x + ", (int)clamp((long)" +
+                           signed_value(c.getArgOperand(1)) +
+                           ", -100000l, 100000l))"),
+             true;
+    if (f == "ilogb") return assign(c, "(uint)km_dilogb(" + x + ")"), true;
+    if (f == "lround" || f == "llround")
+      return assign(c, "(ulong)km_d2i(km_droundf(" + x + "))"), true;
+    if (f == "lrint" || f == "llrint")
+      return assign(c, "(ulong)km_d2i(km_drint(" + x + "))"), true;
+    if (f == "modf") {
+      if (isa<StructType>(c.getType()))  // llvm.modf: {fraction, integral}
+        return line(n + "_0 = km_dmodf(" + x + ", " + n + "_1);"), true;
+      line("{ ulong i; " + n + " = km_dmodf(" + x + ", i); " +
+           memory(c.getArgOperand(1), c.getType()) + " = i; }");
+      return true;
+    }
+    if (f == "frexp") {
+      if (isa<StructType>(c.getType()))  // llvm.frexp: {fraction, exponent}
+        return line("{ int e; " + n + "_0 = km_dfrexp(" + x + ", e); " + n +
+                    "_1 = (uint)e; }"),
+               true;
+      line("{ int e; " + n + " = km_dfrexp(" + x + ", e);");
+      store_int(c, 1, "e");
+      line("}");
+      return true;
+    }
+    if (f == "remquo") {
+      line("{ int q; " + n + " = km_dremquo(" + x + ", " + arg(c, 1) +
+           ", q);");
+      store_int(c, 2, "q");
+      line("}");
+      return true;
+    }
     if (f == "ldexp")
       return assign(c, "km_dldexp(" + arg(c, 0) + ", (int)" + arg(c, 1) + ")"),
              true;
@@ -1267,6 +1529,37 @@ class Emitter {
       assign(c, precise(f) + "(" + arg(c, 0) + ", " + arg(c, 1) + ")");
     };
     Type* t = c.getType();
+    if (t->isIntegerTy() && odd_width(t->getIntegerBitWidth())) {
+      unsigned bits = t->getIntegerBitWidth();
+      std::string T = scalar_type(t);
+      if (bits > 64 && id != Intrinsic::umin && id != Intrinsic::umax)
+        unsupported("the intrinsic " + c.getCalledFunction()->getName() +
+                        " on integers wider than 64 bits",
+                    &c);
+      switch (id) {
+        case Intrinsic::umin:
+        case Intrinsic::umax:
+          return assign(c, "(" + arg(c, 0) + (id == Intrinsic::umin ? " < " : " > ") +
+                               arg(c, 1) + " ? " + arg(c, 0) + " : " + arg(c, 1) + ")");
+        case Intrinsic::smin:
+        case Intrinsic::smax:
+          return assign(c, fit(std::string(id == Intrinsic::smin ? "min(" : "max(") +
+                                   signed_value(c.getArgOperand(0)) + ", " +
+                                   signed_value(c.getArgOperand(1)) + ")",
+                               bits));
+        case Intrinsic::abs:
+          return assign(c, fit("abs(" + signed_value(c.getArgOperand(0)) + ")", bits));
+        case Intrinsic::ctpop:
+          return assign(c, "(" + T + ")popcount(" + arg(c, 0) + ")");
+        case Intrinsic::ctlz:
+          return assign(c, "(" + T + ")(clz(" + arg(c, 0) + ") - " +
+                               std::to_string(container_width(bits) - bits) + ")");
+        default:
+          unsupported("the intrinsic " + c.getCalledFunction()->getName() +
+                          " on integers of " + Twine(bits) + " bits",
+                      &c);
+      }
+    }
     switch (id) {
       // No-ops for the GPU.
       case Intrinsic::lifetime_start:
@@ -1346,6 +1639,23 @@ class Emitter {
             c, "fma(" + arg(c, 0) + ", " + arg(c, 1) + ", " + arg(c, 2) + ")");
       case Intrinsic::ldexp:
         return assign(c, "ldexp(" + arg(c, 0) + ", (int)" + arg(c, 1) + ")");
+      case Intrinsic::modf: {
+        const std::string& n = names[&c];
+        return line(n + "_0 = modf(" + arg(c, 0) + ", " + n + "_1);");
+      }
+      case Intrinsic::frexp: {
+        const std::string& n = names[&c];
+        return line("{ int e; " + n + "_0 = frexp(" + arg(c, 0) + ", e); " +
+                    n + "_1 = (uint)e; }");
+      }
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+        return assign(c, "(" + scalar_type(t) + ")(long)round(" + arg(c, 0) +
+                             ")");
+      case Intrinsic::lrint:
+      case Intrinsic::llrint:
+        return assign(c, "(" + scalar_type(t) + ")(long)rint(" + arg(c, 0) +
+                             ")");
       case Intrinsic::powi:
         return assign(c, "precise::pow(" + arg(c, 0) + ", (" + scalar_type(t) +
                              ")(int)" + arg(c, 1) + ")");
@@ -1493,6 +1803,92 @@ template <typename P> inline float km_atomic_fmin(P p, float v) {
                                                 memory_order_relaxed, memory_order_relaxed)) {}
   return as_type<float>(old);
 }
+// Atomics Metal lacks (nand, and any on 8- or 16-bit integers): a CAS loop on
+// the aligned word holding the value, which sits at bit `shift` and is `bits`
+// wide.
+enum { KM_XCHG, KM_ADD, KM_SUB, KM_AND, KM_OR, KM_XOR, KM_NAND, KM_MAX, KM_MIN, KM_UMAX, KM_UMIN };
+inline uint km_rmw_op(uint op, uint x, uint v, uint bits) {
+  int sx = (int)(x << (32 - bits)) >> (32 - bits), sv = (int)(v << (32 - bits)) >> (32 - bits);
+  switch (op) {
+    case KM_XCHG: return v;
+    case KM_ADD: return x + v;
+    case KM_SUB: return x - v;
+    case KM_AND: return x & v;
+    case KM_OR: return x | v;
+    case KM_XOR: return x ^ v;
+    case KM_NAND: return ~(x & v);
+    case KM_MAX: return (uint)max(sx, sv);
+    case KM_MIN: return (uint)min(sx, sv);
+    case KM_UMAX: return max(x, v);
+    default: return min(x, v);
+  }
+}
+template <typename P> inline uint km_atomic_rmw(P w, uint shift, uint bits, uint op, uint v) {
+  uint mask = bits == 32 ? ~0u : ((1u << bits) - 1) << shift;
+  uint old = atomic_load_explicit(w, memory_order_relaxed);
+  for (;;) {
+    uint x = (old & mask) >> shift;
+    uint repl = (old & ~mask) | ((km_rmw_op(op, x, v, bits) << shift) & mask);
+    if (atomic_compare_exchange_weak_explicit(w, &old, repl, memory_order_relaxed, memory_order_relaxed)) return x;
+  }
+}
+template <typename P> inline uint km_cas_narrow(P w, uint shift, uint bits, uint cmp, uint val, thread bool& ok) {
+  uint mask = ((1u << bits) - 1) << shift;
+  uint old = atomic_load_explicit(w, memory_order_relaxed);
+  for (;;) {
+    uint x = (old & mask) >> shift;
+    if (x != cmp) { ok = false; return x; }
+    if (atomic_compare_exchange_weak_explicit(w, &old, (old & ~mask) | (val << shift), memory_order_relaxed, memory_order_relaxed)) {
+      ok = true;
+      return x;
+    }
+  }
+}
+// Kokkos::abort: the first thread to abort leaves its message after the flag.
+template <typename P> inline void km_abort(device atomic_uint* flag, P message) {
+  if (atomic_exchange_explicit(flag, 1u, memory_order_relaxed) != 0) return;
+  device uchar* out = (device uchar*)flag + 16;
+  uint i = 0;
+  for (; i < 1007 && message[i]; ++i) out[i] = message[i];
+  out[i] = 0;
+}
+// Integers of 65 to 128 bits, which the optimizer makes for closed forms like
+// n(n-1)/2 of a 64-bit n.
+struct km_u128 {
+  ulong lo, hi;
+  km_u128() = default;
+  km_u128(ulong l, ulong h = 0) : lo(l), hi(h) {}
+  explicit operator ulong() const { return lo; }
+  explicit operator bool() const { return (lo | hi) != 0; }
+};
+inline km_u128 operator+(km_u128 a, km_u128 b) { ulong lo = a.lo + b.lo; return km_u128(lo, a.hi + b.hi + (lo < a.lo)); }
+inline km_u128 operator-(km_u128 a, km_u128 b) { return km_u128(a.lo - b.lo, a.hi - b.hi - (a.lo < b.lo)); }
+inline km_u128 operator*(km_u128 a, km_u128 b) { return km_u128(a.lo * b.lo, mulhi(a.lo, b.lo) + a.lo * b.hi + a.hi * b.lo); }
+inline km_u128 operator&(km_u128 a, km_u128 b) { return km_u128(a.lo & b.lo, a.hi & b.hi); }
+inline km_u128 operator|(km_u128 a, km_u128 b) { return km_u128(a.lo | b.lo, a.hi | b.hi); }
+inline km_u128 operator^(km_u128 a, km_u128 b) { return km_u128(a.lo ^ b.lo, a.hi ^ b.hi); }
+inline km_u128 operator<<(km_u128 a, km_u128 s) {
+  uint n = (uint)s.lo & 127;
+  if (n == 0) return a;
+  if (n >= 64) return km_u128(0, a.lo << (n - 64));
+  return km_u128(a.lo << n, (a.hi << n) | (a.lo >> (64 - n)));
+}
+inline km_u128 operator>>(km_u128 a, km_u128 s) {
+  uint n = (uint)s.lo & 127;
+  if (n == 0) return a;
+  if (n >= 64) return km_u128(a.hi >> (n - 64), 0);
+  return km_u128((a.lo >> n) | (a.hi << (64 - n)), a.hi >> n);
+}
+inline bool operator==(km_u128 a, km_u128 b) { return a.lo == b.lo && a.hi == b.hi; }
+inline bool operator!=(km_u128 a, km_u128 b) { return !(a == b); }
+inline bool operator<(km_u128 a, km_u128 b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+inline bool operator>(km_u128 a, km_u128 b) { return b < a; }
+inline bool operator<=(km_u128 a, km_u128 b) { return !(b < a); }
+inline bool operator>=(km_u128 a, km_u128 b) { return !(a < b); }
+inline km_u128 km_sext128(long x) { return km_u128((ulong)x, (ulong)(x >> 63)); }
+inline km_u128 km_mask128(km_u128 a, uint bits) {
+  return bits >= 128 ? a : km_u128(a.lo, a.hi & ((1ul << (bits - 64)) - 1));
+}
 inline ushort km_bswap(ushort x) { return (x >> 8) | (x << 8); }
 inline uint km_bswap(uint x) { return (x >> 24) | ((x >> 8) & 0xff00u) | ((x << 8) & 0xff0000u) | (x << 24); }
 inline ulong km_bswap(ulong x) { return ((ulong)km_bswap((uint)x) << 32) | km_bswap((uint)(x >> 32)); }
@@ -1502,6 +1898,12 @@ template <typename T> inline T km_expm1(T x) {
 template <typename T> inline T km_log1p(T x) {
   T u = T(1) + x;
   return u == T(1) ? x : precise::log(u) * x / (u - T(1));
+}
+// MSL has no cbrt: pow and a Newton step.
+inline float km_cbrt(float x) {
+  if (x == 0 || !isfinite(x)) return x;
+  float y = copysign(precise::pow(fabs(x), 1.0f / 3.0f), x);
+  return y - (y * y * y - x) / (3.0f * y * y);
 }
 template <typename T> inline T km_hypot(T x, T y) { return length(vec<T, 2>(x, y)); }
 template <typename T> inline T km_remainder(T x, T y) { return x - y * rint(x / y); }
@@ -1514,6 +1916,55 @@ inline float km_erfc(float x) {
   return x >= 0 ? r : 2.0f - r;
 }
 inline float km_erf(float x) { return 1.0f - km_erfc(x); }
+// FP_ILOGB0 and FP_ILOGBNAN are INT_MIN on Apple platforms.
+inline int km_ilogb(float x) {
+  uint b = as_type<uint>(x) & 0x7fffffffu;
+  if (b == 0 || b > 0x7f800000u) return (int)0x80000000u;
+  if (b == 0x7f800000u) return 0x7fffffff;
+  if (b < 0x00800000u) return (31 - (int)clz(b)) - 149;
+  return (int)(b >> 23) - 127;
+}
+inline float km_logb(float x) {
+  if (x == 0) return -INFINITY;
+  if (isinf(x)) return INFINITY;
+  return isnan(x) ? x : (float)km_ilogb(x);
+}
+inline float km_nextafter(float x, float y) {
+  if (isnan(x) || isnan(y)) return x + y;
+  if (x == y) return y;
+  if (x == 0) return as_type<float>((as_type<uint>(y) & 0x80000000u) | 1u);
+  uint b = as_type<uint>(x);
+  return as_type<float>((x < y) == (x > 0) ? b + 1 : b - 1);
+}
+inline float km_remquo(float x, float y, thread int& q) {
+  float n = rint(x / y);
+  q = (int)fmod(fabs(n), 128.0f);
+  if (n < 0) q = -q;
+  return fma(-y, n, x);
+}
+// Lanczos (g = 7, n = 9) with reflection below 1/2.
+inline float km_lanczos(float z, thread float& t) {
+  const float c[9] = {0.99999999999980993f, 676.5203681218851f, -1259.1392167224028f,
+                      771.32342877765313f, -176.61502916214059f, 12.507343278686905f,
+                      -0.13857109526572012f, 9.9843695780195716e-6f, 1.5056327351493116e-7f};
+  z -= 1;
+  float a = c[0];
+  for (int i = 1; i < 9; ++i) a += c[i] / (z + i);
+  t = z + 7.5f;
+  return a;
+}
+inline float km_tgamma(float x) {
+  float z = x < 0.5f ? 1 - x : x, t;
+  float a = km_lanczos(z, t);
+  float g = 2.5066282746310002f * precise::pow(t, z - 0.5f) * precise::exp(-t) * a;
+  return x < 0.5f ? M_PI_F / (precise::sin(M_PI_F * x) * g) : g;
+}
+inline float km_lgamma(float x) {
+  float z = x < 0.5f ? 1 - x : x, t;
+  float a = km_lanczos(z, t);
+  float l = 0.91893853320467274f + (z - 0.5f) * precise::log(t) - t + precise::log(a);
+  return x < 0.5f ? precise::log(M_PI_F / fabs(precise::sin(M_PI_F * x))) - l : l;
+}
 
 // --- fp64 in software ----------------------------------------------------------
 // Apple GPUs have no double precision. A double is held as its bit pattern in
@@ -1846,6 +2297,54 @@ inline ulong km_dldexp(ulong a, int n) {
 }
 inline bool km_dinf(ulong a) { return (a << 1) == 0xffe0000000000000ul; }
 inline bool km_dfinite(ulong a) { return km_dexpo(a) != 0x7ff; }
+inline int km_dilogb(ulong a) {
+  a &= ~KM_DSIGN;
+  if (a == 0 || a > KM_DINF) return (int)0x80000000u;
+  if (a == KM_DINF) return 0x7fffffff;
+  if (km_dexpo(a) == 0) return (63 - (int)clz(a)) - 1074;
+  return km_dexpo(a) - 0x3ff;
+}
+inline ulong km_dlogb(ulong a) {
+  if ((a << 1) == 0) return KM_DSIGN | KM_DINF;
+  if (km_dinf(a)) return KM_DINF;
+  return km_dnan(a) ? a : km_i2d(km_dilogb(a));
+}
+inline ulong km_dmodf(ulong a, thread ulong& i) {
+  i = km_dtrunc(a);
+  if (km_dnan(a)) return a;
+  return km_dinf(a) ? (a & KM_DSIGN) : km_dcopysign(km_dsub(a, i), a);
+}
+inline ulong km_dfrexp(ulong a, thread int& e) {
+  e = 0;
+  if ((a << 1) == 0 || km_dexpo(a) == 0x7ff) return a;
+  ulong sign = a & KM_DSIGN;
+  a &= ~KM_DSIGN;
+  int exp = km_dexpo(a);
+  if (exp == 0) {  // subnormal: normalise
+    int sh = (int)clz(a) - 11;
+    a <<= sh;
+    exp = 1 - sh;
+  }
+  e = exp - 0x3fe;
+  return sign | (a & KM_DFRAC) | (0x3feul << 52);
+}
+inline ulong km_dnextafter(ulong x, ulong y) {
+  if (km_dnan(x) || km_dnan(y)) return km_dnan2(x, y);
+  if (km_deq(x, y)) return y;
+  if (((x | y) << 1) == 0) return y;
+  if ((x << 1) == 0) return (y & KM_DSIGN) | 1;
+  return km_dlt(x, y) == !(x & KM_DSIGN) ? x + 1 : x - 1;
+}
+inline ulong km_dremquo(ulong x, ulong y, thread int& q) {
+  ulong n = km_drint(km_ddiv(x, y));
+  q = (int)(km_d2i(km_dabs(n)) & 127);
+  if (n & KM_DSIGN) q = -q;
+  return km_dfma(km_dneg(y), n, x);
+}
+inline ulong km_dremainder(ulong x, ulong y) {
+  int q;
+  return km_dremquo(x, y, q);
+}
 )";
   return text;
 }

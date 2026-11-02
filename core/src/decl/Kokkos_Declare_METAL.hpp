@@ -13,6 +13,7 @@
 #include <Metal/Kokkos_Metal_Parallel_Range.hpp>
 #include <Metal/Kokkos_Metal_Parallel_MDRange.hpp>
 #include <Metal/Kokkos_Metal_Parallel_Team.hpp>
+#include <Metal/Kokkos_Metal_UniqueToken.hpp>
 #endif
 
 #endif

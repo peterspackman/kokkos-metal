@@ -28,7 +28,10 @@ void Metal::impl_initialize(InitializationSettings const&) {
   Kokkos::Impl::MetalRuntime::initialize();
 }
 
-void Metal::impl_finalize() { Kokkos::Impl::MetalRuntime::finalize(); }
+void Metal::impl_finalize() {
+  (void)Kokkos::Impl::metal_global_unique_token_locks(true);
+  Kokkos::Impl::MetalRuntime::finalize();
+}
 
 bool Metal::impl_is_initialized() {
   return Kokkos::Impl::MetalRuntime::is_initialized();
@@ -51,7 +54,6 @@ void Metal::impl_static_fence(std::string const& name) {
       [] { Kokkos::Impl::MetalRuntime::fence(); });
 }
 
-int Metal::concurrency() { return 64 * 1024; }
 
 namespace Impl {
 
@@ -85,32 +87,47 @@ template class MetalSpaceBase<MetalSharedSpace>;
 
 namespace Impl {
 
-void* metal_scratch(size_t bytes) {
-  static std::mutex mutex;
-  static void* ptr   = nullptr;
-  static size_t size = 0;
-  std::lock_guard<std::mutex> lock(mutex);
-  if (bytes > size) {
-    MetalRuntime::deallocate(ptr);  // fences: a kernel may still use it
-    size = std::max(bytes, 2 * size);
-    ptr  = MetalRuntime::allocate(size);
+namespace {
+
+struct ScratchPool {
+  std::mutex mutex;
+  void* ptr   = nullptr;
+  size_t size = 0;
+
+  MetalScratch get(size_t bytes) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (bytes > size) {
+      MetalRuntime::deallocate(ptr);  // fences: a kernel may still use it
+      size = std::max(bytes, 2 * size);
+      ptr  = MetalRuntime::allocate(size);
+    }
+    return {std::move(lock), static_cast<char*>(ptr)};
   }
-  return ptr;
+};
+
+}  // namespace
+
+MetalScratch metal_scratch(size_t bytes) {
+  static ScratchPool pool;
+  return pool.get(bytes);
 }
 
-// Level-1 team scratch: apart from metal_scratch, which a team reduction
-// uses at the same time.
-void* metal_team_scratch(size_t bytes) {
-  static std::mutex mutex;
-  static void* ptr   = nullptr;
-  static size_t size = 0;
-  std::lock_guard<std::mutex> lock(mutex);
-  if (bytes > size) {
-    MetalRuntime::deallocate(ptr);
-    size = std::max(bytes, 2 * size);
-    ptr  = MetalRuntime::allocate(size);
-  }
-  return ptr;
+// Apart from metal_scratch, which a team reduction uses at the same time.
+MetalScratch metal_team_scratch(size_t bytes) {
+  static ScratchPool pool;
+  return pool.get(bytes);
+}
+
+Kokkos::View<uint32_t*, Kokkos::Experimental::MetalSpace>
+metal_global_unique_token_locks(bool deallocate) {
+  static Kokkos::View<uint32_t*, Kokkos::Experimental::MetalSpace> locks;
+  if (deallocate)
+    locks = {};
+  else if (locks.extent(0) == 0)
+    locks = Kokkos::View<uint32_t*, Kokkos::Experimental::MetalSpace>(
+        "Kokkos::UniqueToken<Metal>::m_locks",
+        Kokkos::Experimental::Metal::concurrency());
+  return locks;
 }
 
 void metal_deep_copy(void* dst, const void* src, size_t n, bool host_involved) {

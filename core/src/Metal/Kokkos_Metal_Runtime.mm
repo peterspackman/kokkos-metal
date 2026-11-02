@@ -83,6 +83,7 @@ kernel void kmetal_bias(constant BiasArgs& a [[buffer(0)]], uint2 p [[thread_pos
 // Dispatches per command buffer before it is committed, so the GPU starts on
 // work while the host is still enqueueing.
 constexpr int kDispatchesPerCommandBuffer = 32;
+constexpr uint32_t kPrintfBytes           = 1u << 20;
 
 struct State {
   id<MTLDevice> device                 = nil;
@@ -90,9 +91,14 @@ struct State {
   id<MTLResidencySet> residency        = nil;
   id<MTLCommandBuffer> command_buffer  = nil;
   id<MTLComputeCommandEncoder> encoder = nil;
+  // Command buffers complete in order: waiting for the last one committed
+  // waits for everything before it. Kept after a fence, so that every thread
+  // fencing waits for it, not only the first.
   id<MTLCommandBuffer> last_committed  = nil;
   // Set by a kernel that called Kokkos::abort; checked at each fence.
   id<MTLBuffer> abort_flag = nil;
+  // Kokkos::printf records (see MetalDevice::printf), printed at fences.
+  id<MTLBuffer> printf_buffer = nil;
   int dispatches           = 0;
   bool residency_dirty     = false;
 
@@ -297,7 +303,12 @@ void initialize() {
     if (!s->residency) fail("cannot create a residency set");
     [s->queue addResidencySet:s->residency];
     s->options    = make_compile_options();
-    s->abort_flag = [s->device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    // The flag, then the message of the first kernel thread to abort.
+    s->abort_flag = [s->device newBufferWithLength:1024 options:MTLResourceStorageModeShared];
+    s->printf_buffer = [s->device newBufferWithLength:kPrintfBytes
+                                              options:MTLResourceStorageModeShared];
+    static_cast<uint32_t*>(s->printf_buffer.contents)[0] = 0;
+    static_cast<uint32_t*>(s->printf_buffer.contents)[1] = kPrintfBytes - 16;
     s->dump_dir   = getenv("KOKKOS_METAL_DUMP");
     s->stats      = getenv("KOKKOS_METAL_STATS") != nullptr;
     s->nancheck   = getenv("KOKKOS_METAL_NANCHECK") != nullptr;
@@ -380,7 +391,9 @@ void* allocate(size_t bytes) {
 void deallocate(void* ptr) {
   if (!ptr || !g_state) return;
   State& s = state();
-  if (s.command_buffer || s.last_committed) ++s.n_busy_free;
+  if (s.command_buffer ||
+      (s.last_committed && s.last_committed.status != MTLCommandBufferStatusCompleted))
+    ++s.n_busy_free;
   fence();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   auto it = s.allocations.find(ptr);
@@ -415,6 +428,7 @@ void dispatch(const void* key, const void* args, size_t args_size, const uint32_
       }];
     }
     if (k.desc.flags & kUsesAbort) [enc setBuffer:s.abort_flag offset:0 atIndex:1];
+    if (k.desc.flags & kUsesPrintf) [enc setBuffer:s.printf_buffer offset:0 atIndex:2];
     if (k.desc.flags & kUsesThreadgroupMemory)
       [enc setThreadgroupMemoryLength:(threadgroup_bytes + 15) / 16 * 16 ?: 16 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
@@ -683,6 +697,104 @@ void gemm(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, in
   }
 }
 
+// One printf conversion of a kernel's record, with its 64-bit argument read as
+// the type the conversion and its length modifier name.
+static std::string format_one(std::string spec, const std::string& length, char conv, uint64_t v) {
+  char buf[512];
+  auto out = [&](auto x) {
+    std::snprintf(buf, sizeof buf, spec.c_str(), x);
+    return std::string(buf);
+  };
+  const bool wide = length == "l" || length == "ll" || length == "j" || length == "z" ||
+                    length == "t";
+  switch (conv) {
+    case 'd':
+    case 'i':
+      spec += "lld";
+      if (wide) return out((long long)v);
+      if (length == "h") return out((long long)(short)v);
+      if (length == "hh") return out((long long)(signed char)v);
+      return out((long long)(int)v);
+    case 'u':
+    case 'x':
+    case 'X':
+    case 'o':
+      spec += std::string("ll") + conv;
+      if (wide) return out((unsigned long long)v);
+      if (length == "h") return out((unsigned long long)(unsigned short)v);
+      if (length == "hh") return out((unsigned long long)(unsigned char)v);
+      return out((unsigned long long)(unsigned)v);
+    case 'c': return out(int(v)) ;
+    case 'p': return out((void*)(uintptr_t)v);
+    case 's': return "(string)";
+    default: {
+      double d;
+      std::memcpy(&d, &v, sizeof d);
+      return out(d);
+    }
+  }
+}
+
+// Prints the records the kernels' Kokkos::printf calls left, and empties the
+// buffer.
+static void print_kernel_output(State& s) {
+  auto* base           = static_cast<char*>(s.printf_buffer.contents);
+  auto* header         = reinterpret_cast<uint32_t*>(base);
+  const uint32_t used  = header[0];
+  if (used == 0) return;
+  const uint32_t end = std::min(used, header[1]);
+  std::string text;
+  for (uint32_t off = 0; off + 8 <= end;) {
+    const char* rec       = base + 16 + off;
+    const uint32_t size   = reinterpret_cast<const uint32_t*>(rec)[0];
+    const uint32_t n      = reinterpret_cast<const uint32_t*>(rec)[1];
+    if (size == 0 || off + size > end) break;
+    const uint64_t* args  = reinterpret_cast<const uint64_t*>(rec + 8);
+    const char* f         = rec + 8 + 8 * n;
+    uint32_t next         = 0;
+    auto arg              = [&]() { return next < n ? args[next++] : 0; };
+    while (*f) {
+      if (*f != '%') {
+        text += *f++;
+        continue;
+      }
+      if (f[1] == '%') {
+        text += '%';
+        f += 2;
+        continue;
+      }
+      std::string spec = "%";
+      ++f;
+      while (*f && std::strchr("-+ #0", *f)) spec += *f++;
+      for (int part = 0; part < 2; ++part) {  // width, then .precision
+        if (part == 1) {
+          if (*f != '.') break;
+          spec += *f++;
+        }
+        if (*f == '*') {
+          spec += std::to_string((int)arg());
+          ++f;
+        }
+        while (*f >= '0' && *f <= '9') spec += *f++;
+      }
+      std::string length;
+      while (*f && std::strchr("hljztL", *f)) length += *f++;
+      if (!*f) break;
+      const char conv = *f++;
+      if (conv == 'n') continue;
+      if (std::strchr("fFeEgGaA", conv)) spec += conv;
+      text += format_one(spec, length, conv, arg());
+    }
+    off += size;
+  }
+  header[0] = 0;
+  std::fwrite(text.data(), 1, text.size(), stdout);
+  std::fflush(stdout);
+  if (used > header[1])
+    std::fprintf(stderr, "Kokkos::Metal: printf buffer full, %u bytes of kernel output dropped\n",
+                 used - header[1]);
+}
+
 void fence() {
   if (!g_state) return;
   State& s = *g_state;
@@ -690,8 +802,7 @@ void fence() {
   {
     std::lock_guard<std::recursive_mutex> lock(s.mutex);
     commit(s);
-    last             = s.last_committed;
-    s.last_committed = nil;
+    last = s.last_committed;
   }
   ++s.n_fence;
   if (last) {
@@ -700,10 +811,16 @@ void fence() {
     s.t_fence += now() - t0;
     check(last);
   }
+  {
+    // Only when the GPU is idle: another thread's kernels may be appending.
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.last_committed == last && !s.command_buffer) print_kernel_output(s);
+  }
   auto* flag = static_cast<uint32_t*>(s.abort_flag.contents);
   if (*flag) {
     *flag = 0;
-    fail("Kokkos::abort was called in a kernel");
+    fail(std::string("Kokkos::abort was called in a kernel: ") +
+         (static_cast<const char*>(s.abort_flag.contents) + 16));
   }
 }
 

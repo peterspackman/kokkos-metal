@@ -24,8 +24,11 @@
 namespace Kokkos::Impl {
 
 inline constexpr uint32_t kMetalTeamReserve = 2048;
-// Most threadgroups a team kernel launches: what level-1 scratch is sized for.
+// Most threadgroups a team kernel launches; each strides over leagues.
 inline constexpr uint32_t kMetalMaxTeamGroups = 4096;
+// Level-1 scratch, in device memory: the most one team may ask for, and the
+// most a launch's teams use together.
+inline constexpr size_t kMetalLevel1Bytes = size_t(256) << 20;
 
 // Shuffles of any trivially copyable T, a 32-bit word at a time.
 template <class T, class Shuffle>
@@ -173,6 +176,22 @@ class MetalTeamMember {
     value   = impl_reduce(
         value, [&](V& a, const V& b) { reducer.join(a, b); },
         uint32_t(m_vector_length));
+  }
+
+  // The value joined over this thread's vector lanes; every lane gets it.
+  template <class ReducerType>
+  KOKKOS_INLINE_FUNCTION std::enable_if_t<is_reducer<ReducerType>::value>
+  vector_reduce(ReducerType const& reducer) const noexcept {
+    vector_reduce(reducer, reducer.reference());
+  }
+
+  template <class ReducerType>
+  KOKKOS_INLINE_FUNCTION std::enable_if_t<is_reducer<ReducerType>::value>
+  vector_reduce(ReducerType const& reducer,
+                typename ReducerType::value_type& value) const noexcept {
+    using V = typename ReducerType::value_type;
+    value   = metal_vector_reduce(*this, value,
+                                  [&](V& a, const V& b) { reducer.join(a, b); });
   }
 
   // Exclusive scan over team ranks, in team-rank order; with `carry`, the
@@ -365,18 +384,66 @@ KOKKOS_INLINE_FUNCTION T metal_vector_reduce(const MetalTeamMember& m, T v,
   return metal_shuffle(v, lane - my);
 }
 
-template <class Reducer, class Loop>
-KOKKOS_INLINE_FUNCTION void metal_nested_reduce(const MetalTeamMember& m,
-                                                const Reducer& reducer,
-                                                uint32_t stride, bool vector,
-                                                const Loop& loop) {
-  using V = typename Reducer::value_type;
+// What FunctorAnalysis makes of R for values of type V: R's own init, join
+// and final where it has them (a reducer, or a functor), else a sum.
+template <class R, class V>
+using MetalNestedReducer =
+    typename FunctorAnalysis<FunctorPatternInterface::REDUCE,
+                             TeamPolicy<Kokkos::Experimental::Metal>, R,
+                             V>::Reducer;
+
+template <class Wrapped, class Loop>
+KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
+    const MetalTeamMember& m, const Wrapped& w,
+    typename Wrapped::value_type& result, uint32_t stride, bool vector,
+    const Loop& loop) {
+  using V = typename Wrapped::value_type;
   V v;
-  reducer.init(v);
+  w.init(&v);
   loop(v);
-  auto join = [&](V& a, const V& b) { reducer.join(a, b); };
-  reducer.reference() =
-      vector ? metal_vector_reduce(m, v, join) : m.impl_reduce(v, join, stride);
+  auto join = [&](V& a, const V& b) { w.join(&a, &b); };
+  V r = vector ? metal_vector_reduce(m, v, join) : m.impl_reduce(v, join, stride);
+  w.final(&r);
+  result = r;
+}
+
+template <typename iType, class Closure, class Wrapped>
+KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
+    const TeamThreadRangeBoundariesStruct<iType, MetalTeamMember>& r,
+    const Closure& closure, const Wrapped& w,
+    typename Wrapped::value_type& result) {
+  metal_nested_reduce(r.member, w, result, r.member.impl_vector_length(),
+                      false, [&](auto& v) {
+                        for (iType i = r.start + r.member.team_rank();
+                             i < r.end; i += r.member.team_size())
+                          closure(i, v);
+                      });
+}
+
+template <typename iType, class Closure, class Wrapped>
+KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
+    const TeamVectorRangeBoundariesStruct<iType, MetalTeamMember>& r,
+    const Closure& closure, const Wrapped& w,
+    typename Wrapped::value_type& result) {
+  const int n = r.member.impl_vector_length();
+  metal_nested_reduce(r.member, w, result, 1, false, [&](auto& v) {
+    for (iType i =
+             r.start + r.member.team_rank() * n + r.member.impl_vector_lane();
+         i < r.end; i += r.member.team_size() * n)
+      closure(i, v);
+  });
+}
+
+template <typename iType, class Closure, class Wrapped>
+KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
+    const ThreadVectorRangeBoundariesStruct<iType, MetalTeamMember>& r,
+    const Closure& closure, const Wrapped& w,
+    typename Wrapped::value_type& result) {
+  metal_nested_reduce(r.member, w, result, 1, true, [&](auto& v) {
+    for (iType i = r.start + r.member.impl_vector_lane(); i < r.end;
+         i += r.member.impl_vector_length())
+      closure(i, v);
+  });
 }
 
 }  // namespace Impl
@@ -386,38 +453,10 @@ KOKKOS_INLINE_FUNCTION std::enable_if_t<Kokkos::is_reducer<ReducerType>::value>
 parallel_reduce(const Impl::TeamThreadRangeBoundariesStruct<
                     iType, Impl::MetalTeamMember>& r,
                 const Closure& closure, const ReducerType& reducer) {
-  Impl::metal_nested_reduce(r.member, reducer, r.member.impl_vector_length(),
-                            false, [&](auto& v) {
-                              for (iType i = r.start + r.member.team_rank();
-                                   i < r.end; i += r.member.team_size())
-                                closure(i, v);
-                            });
-}
-
-template <typename iType, class Closure, class ReducerType>
-KOKKOS_INLINE_FUNCTION std::enable_if_t<Kokkos::is_reducer<ReducerType>::value>
-parallel_reduce(const Impl::TeamVectorRangeBoundariesStruct<
-                    iType, Impl::MetalTeamMember>& r,
-                const Closure& closure, const ReducerType& reducer) {
-  const int n = r.member.impl_vector_length();
-  Impl::metal_nested_reduce(r.member, reducer, 1, false, [&](auto& v) {
-    for (iType i =
-             r.start + r.member.team_rank() * n + r.member.impl_vector_lane();
-         i < r.end; i += r.member.team_size() * n)
-      closure(i, v);
-  });
-}
-
-template <typename iType, class Closure, class ReducerType>
-KOKKOS_INLINE_FUNCTION std::enable_if_t<Kokkos::is_reducer<ReducerType>::value>
-parallel_reduce(const Impl::ThreadVectorRangeBoundariesStruct<
-                    iType, Impl::MetalTeamMember>& r,
-                const Closure& closure, const ReducerType& reducer) {
-  Impl::metal_nested_reduce(r.member, reducer, 1, true, [&](auto& v) {
-    for (iType i = r.start + r.member.impl_vector_lane(); i < r.end;
-         i += r.member.impl_vector_length())
-      closure(i, v);
-  });
+  using V = typename ReducerType::value_type;
+  Impl::metal_nested_reduce(r, closure,
+                            Impl::MetalNestedReducer<ReducerType, V>(reducer),
+                            reducer.reference());
 }
 
 template <typename iType, class Closure, typename ValueType>
@@ -425,7 +464,19 @@ KOKKOS_INLINE_FUNCTION std::enable_if_t<!Kokkos::is_reducer<ValueType>::value>
 parallel_reduce(const Impl::TeamThreadRangeBoundariesStruct<
                     iType, Impl::MetalTeamMember>& r,
                 const Closure& closure, ValueType& result) {
-  parallel_reduce(r, closure, Kokkos::Sum<ValueType>(result));
+  Impl::metal_nested_reduce(
+      r, closure, Impl::MetalNestedReducer<Closure, ValueType>(closure), result);
+}
+
+template <typename iType, class Closure, class ReducerType>
+KOKKOS_INLINE_FUNCTION std::enable_if_t<Kokkos::is_reducer<ReducerType>::value>
+parallel_reduce(const Impl::TeamVectorRangeBoundariesStruct<
+                    iType, Impl::MetalTeamMember>& r,
+                const Closure& closure, const ReducerType& reducer) {
+  using V = typename ReducerType::value_type;
+  Impl::metal_nested_reduce(r, closure,
+                            Impl::MetalNestedReducer<ReducerType, V>(reducer),
+                            reducer.reference());
 }
 
 template <typename iType, class Closure, typename ValueType>
@@ -433,7 +484,19 @@ KOKKOS_INLINE_FUNCTION std::enable_if_t<!Kokkos::is_reducer<ValueType>::value>
 parallel_reduce(const Impl::TeamVectorRangeBoundariesStruct<
                     iType, Impl::MetalTeamMember>& r,
                 const Closure& closure, ValueType& result) {
-  parallel_reduce(r, closure, Kokkos::Sum<ValueType>(result));
+  Impl::metal_nested_reduce(
+      r, closure, Impl::MetalNestedReducer<Closure, ValueType>(closure), result);
+}
+
+template <typename iType, class Closure, class ReducerType>
+KOKKOS_INLINE_FUNCTION std::enable_if_t<Kokkos::is_reducer<ReducerType>::value>
+parallel_reduce(const Impl::ThreadVectorRangeBoundariesStruct<
+                    iType, Impl::MetalTeamMember>& r,
+                const Closure& closure, const ReducerType& reducer) {
+  using V = typename ReducerType::value_type;
+  Impl::metal_nested_reduce(r, closure,
+                            Impl::MetalNestedReducer<ReducerType, V>(reducer),
+                            reducer.reference());
 }
 
 template <typename iType, class Closure, typename ValueType>
@@ -441,7 +504,8 @@ KOKKOS_INLINE_FUNCTION std::enable_if_t<!Kokkos::is_reducer<ValueType>::value>
 parallel_reduce(const Impl::ThreadVectorRangeBoundariesStruct<
                     iType, Impl::MetalTeamMember>& r,
                 const Closure& closure, ValueType& result) {
-  parallel_reduce(r, closure, Kokkos::Sum<ValueType>(result));
+  Impl::metal_nested_reduce(
+      r, closure, Impl::MetalNestedReducer<Closure, ValueType>(closure), result);
 }
 
 // --- nested parallel_scan
@@ -661,7 +725,6 @@ struct MetalTeamReduceDriver {
   }
 };
 
-void* metal_team_scratch(size_t bytes);
 
 template <class... Properties>
 class TeamPolicyInternal<Kokkos::Experimental::Metal, Properties...>
@@ -737,8 +800,9 @@ class TeamPolicyInternal<Kokkos::Experimental::Metal, Properties...>
         m_tune_vector_length(vector_length_request <= 0) {
     if (m_team_size > 0 && m_team_size * m_vector_length > 1024) {
       std::stringstream error;
-      error << "Kokkos::TeamPolicy<Metal>: requested too large team size "
-            << m_team_size << ", maximum " << 1024 / m_vector_length;
+      error << "Kokkos::TeamPolicy<Metal>: Requested too large team size. "
+               "Requested: "
+            << m_team_size << ", Maximum: " << 1024 / m_vector_length;
       Kokkos::Impl::throw_runtime_exception(error.str());
     }
   }
@@ -780,7 +844,7 @@ class TeamPolicyInternal<Kokkos::Experimental::Metal, Properties...>
   static int scratch_size_max(int level) {
     return level == 0
                ? int(MetalRuntime::max_threadgroup_memory() - kMetalTeamReserve)
-               : 256 * 1024 * 1024 / int(kMetalMaxTeamGroups);
+               : kMetalLevel1Bytes;
   }
 
   template <class FunctorType>
@@ -864,8 +928,19 @@ class TeamPolicyInternal<Kokkos::Experimental::Metal, Properties...>
   // The device-side description of a launch with `team_size` ranks.
   template <class FunctorType>
   MetalTeamShape impl_shape(const FunctorType& f, int team_size,
-                            uint32_t& groups) const {
+                            uint32_t& groups, MetalScratch& level1) const {
     groups = uint32_t(std::clamp(m_league_size, 1, int(kMetalMaxTeamGroups)));
+    for (int level = 0; level < 2; ++level) {
+      const int bytes = scratch_size(level, team_size);
+      if (bytes > scratch_size_max(level)) {
+        std::stringstream error;
+        error << "Kokkos::TeamPolicy<Metal>: Requested too much scratch "
+                 "memory on level "
+              << level << ". Requested: " << bytes
+              << ", Maximum: " << scratch_size_max(level);
+        Kokkos::Impl::throw_runtime_exception(error.str());
+      }
+    }
     MetalTeamShape s;
     s.league_size   = m_league_size;
     s.team_size     = team_size;
@@ -874,10 +949,14 @@ class TeamPolicyInternal<Kokkos::Experimental::Metal, Properties...>
         metal_align(scratch_size(0, team_size) +
                          FunctorTeamShmemSize<FunctorType>::value(f, team_size)));
     s.scratch1_size = metal_align(scratch_size(1, team_size));
-    s.scratch1 =
-        s.scratch1_size
-            ? static_cast<char*>(metal_team_scratch(groups * s.scratch1_size))
-            : nullptr;
+    // Fewer threadgroups (each strides over leagues) when teams need much
+    // level-1 scratch.
+    if (s.scratch1_size)
+      groups = uint32_t(std::clamp<size_t>(
+          std::min<size_t>(groups, kMetalLevel1Bytes / s.scratch1_size), 1,
+          groups));
+    if (s.scratch1_size) level1 = metal_team_scratch(groups * s.scratch1_size);
+    s.scratch1 = level1.ptr;
     if (kMetalTeamReserve + s.scratch0 > MetalRuntime::max_threadgroup_memory())
       Kokkos::abort("Kokkos::TeamPolicy<Metal>: level-0 scratch too large");
     return s;
@@ -907,7 +986,9 @@ class ParallelFor<FunctorType, Kokkos::TeamPolicy<Properties...>,
             ? m_policy.team_size()
             : m_policy.team_size_recommended(m_functor, ParallelForTag{});
     uint32_t groups;
-    MetalTeamShape shape = m_policy.impl_shape(m_functor, team_size, groups);
+    MetalScratch level1;
+    MetalTeamShape shape =
+        m_policy.impl_shape(m_functor, team_size, groups, level1);
     const uint32_t threads =
         uint32_t(team_size * m_policy.impl_vector_length());
     if (threads > metal_max_threads<Driver>())
@@ -957,15 +1038,16 @@ class ParallelReduce<CombinedFunctorReducerType,
             : std::max(1, std::min(m_policy.team_size_max_internal(f, reducer),
                                    256 / m_policy.impl_vector_length()));
     uint32_t groups;
-    MetalTeamShape shape = m_policy.impl_shape(f, team_size, groups);
+    MetalScratch level1;
+    MetalTeamShape shape = m_policy.impl_shape(f, team_size, groups, level1);
     if (m_policy.league_size() == 0) shape.league_size = 0;
     const uint32_t threads =
         uint32_t(team_size * m_policy.impl_vector_length());
     if (threads > metal_max_threads<Driver>())
       Kokkos::abort("Kokkos::TeamPolicy<Metal>: team too large for the kernel");
 
-    char* scratch =
-        static_cast<char*>(metal_scratch(metal_align(groups * size) + size));
+    MetalScratch hold = metal_scratch(metal_align(groups * size) + size);
+    char* scratch     = hold.ptr;
     char* out = m_result_on_device && m_result
                     ? reinterpret_cast<char*>(m_result)
                     : scratch + metal_align(groups * size);

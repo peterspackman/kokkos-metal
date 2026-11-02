@@ -28,6 +28,7 @@ enum KernelFlags : uint32_t {
   kUsesAbort             = 1u << 1,
   // The plugin could not translate it; `source` says why.
   kUnsupported = 1u << 2,
+  kUsesPrintf  = 1u << 3,
 };
 
 void initialize();

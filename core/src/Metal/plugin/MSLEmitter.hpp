@@ -25,6 +25,7 @@ struct KernelSource {
   std::string source;  // program-scope constants and the kernel function
   bool uses_threadgroup_memory = false;
   bool uses_abort              = false;  // binds the abort flag as buffer 1
+  bool uses_printf             = false;  // binds the printf buffer as buffer 2
 };
 
 // `F` takes one pointer argument (the driver, bound as buffer 0) and calls

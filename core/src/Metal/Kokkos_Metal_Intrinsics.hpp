@@ -15,6 +15,7 @@
 #define KOKKOS_METAL_INTRINSICS_HPP
 
 #include <cstdint>
+#include <type_traits>
 
 extern "C" {
 // [[thread_position_in_grid]] and friends, component d (0, 1 or 2).
@@ -53,9 +54,14 @@ __kmetal_simd_shuffle_up(uint32_t v, uint32_t delta) noexcept;
 // True in a kernel, false on the host.
 __attribute__((const)) bool __kmetal_is_device() noexcept;
 
-// Kokkos::abort in a kernel: flags the abort, which the next fence reports,
-// and ends the thread.
-[[noreturn]] void __kmetal_abort() noexcept;
+// Kokkos::abort in a kernel: flags the abort, which the next fence reports
+// with the message of the first thread to abort, and ends the thread.
+[[noreturn]] void __kmetal_abort(const char* message) noexcept;
+
+// Kokkos::printf in a kernel appends a record to this buffer: a 32-bit offset
+// and a capacity, then the records from byte 16. The host prints them at the
+// next fence.
+void* __kmetal_printf_buffer() noexcept;
 
 // First statement of each kernel entry: names the key the host launches it by.
 void __kmetal_kernel_key(const void* key) noexcept;
@@ -82,6 +88,39 @@ struct Kernel {
     return &key;
   }
 };
+
+template <class T>
+uint64_t printf_arg(T v) {
+  if constexpr (std::is_floating_point_v<T>)
+    return __builtin_bit_cast(uint64_t, double(v));
+  else if constexpr (std::is_pointer_v<T>)
+    return reinterpret_cast<uintptr_t>(v);
+  else if constexpr (std::is_signed_v<T>)
+    return uint64_t(int64_t(v));
+  else
+    return uint64_t(v);
+}
+
+// A printf record: its size in bytes (a multiple of 8), the argument count,
+// the arguments widened to 64 bits (floating point to double), the format.
+template <class... Args>
+void printf(const char* format, Args... args) {
+  constexpr uint32_t n = sizeof...(Args);
+  uint32_t len         = 0;
+  while (format[len]) ++len;
+  const uint64_t values[n + 1] = {printf_arg(args)..., 0};
+  const uint32_t size          = (8 + 8 * n + len + 1 + 7) & ~7u;
+  auto* buf      = static_cast<char*>(__kmetal_printf_buffer());
+  auto* header   = reinterpret_cast<uint32_t*>(buf);
+  const uint32_t off = __atomic_fetch_add(header, size, __ATOMIC_RELAXED);
+  if (off + size > header[1]) return;
+  char* rec                           = buf + 16 + off;
+  reinterpret_cast<uint32_t*>(rec)[0] = size;
+  reinterpret_cast<uint32_t*>(rec)[1] = n;
+  for (uint32_t i = 0; i < n; ++i)
+    reinterpret_cast<uint64_t*>(rec + 8)[i] = values[i];
+  for (uint32_t i = 0; i <= len; ++i) rec[8 + 8 * n + i] = format[i];
+}
 
 }  // namespace Kokkos::Impl::MetalDevice
 
