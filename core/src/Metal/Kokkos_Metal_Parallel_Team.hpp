@@ -392,17 +392,22 @@ using MetalNestedReducer =
                              TeamPolicy<Kokkos::Experimental::Metal>, R,
                              V>::Reducer;
 
-template <class Wrapped, class Loop>
+// Vector reductions stay inside a SIMD group: the team path, and its slots'
+// limit on the value's size, is not instantiated for them.
+template <bool Vector, class Wrapped, class Loop>
 KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
     const MetalTeamMember& m, const Wrapped& w,
-    typename Wrapped::value_type& result, uint32_t stride, bool vector,
-    const Loop& loop) {
+    typename Wrapped::value_type& result, uint32_t stride, const Loop& loop) {
   using V = typename Wrapped::value_type;
   V v;
   w.init(&v);
   loop(v);
   auto join = [&](V& a, const V& b) { w.join(&a, &b); };
-  V r = vector ? metal_vector_reduce(m, v, join) : m.impl_reduce(v, join, stride);
+  V r;
+  if constexpr (Vector)
+    r = metal_vector_reduce(m, v, join);
+  else
+    r = m.impl_reduce(v, join, stride);
   w.final(&r);
   result = r;
 }
@@ -412,8 +417,8 @@ KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
     const TeamThreadRangeBoundariesStruct<iType, MetalTeamMember>& r,
     const Closure& closure, const Wrapped& w,
     typename Wrapped::value_type& result) {
-  metal_nested_reduce(r.member, w, result, r.member.impl_vector_length(),
-                      false, [&](auto& v) {
+  metal_nested_reduce<false>(r.member, w, result,
+                             r.member.impl_vector_length(), [&](auto& v) {
                         for (iType i = r.start + r.member.team_rank();
                              i < r.end; i += r.member.team_size())
                           closure(i, v);
@@ -426,7 +431,7 @@ KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
     const Closure& closure, const Wrapped& w,
     typename Wrapped::value_type& result) {
   const int n = r.member.impl_vector_length();
-  metal_nested_reduce(r.member, w, result, 1, false, [&](auto& v) {
+  metal_nested_reduce<false>(r.member, w, result, 1, [&](auto& v) {
     for (iType i =
              r.start + r.member.team_rank() * n + r.member.impl_vector_lane();
          i < r.end; i += r.member.team_size() * n)
@@ -439,7 +444,7 @@ KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
     const ThreadVectorRangeBoundariesStruct<iType, MetalTeamMember>& r,
     const Closure& closure, const Wrapped& w,
     typename Wrapped::value_type& result) {
-  metal_nested_reduce(r.member, w, result, 1, true, [&](auto& v) {
+  metal_nested_reduce<true>(r.member, w, result, 1, [&](auto& v) {
     for (iType i = r.start + r.member.impl_vector_lane(); i < r.end;
          i += r.member.impl_vector_length())
       closure(i, v);
