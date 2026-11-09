@@ -417,12 +417,12 @@ KOKKOS_INLINE_FUNCTION void metal_nested_reduce(
     const TeamThreadRangeBoundariesStruct<iType, MetalTeamMember>& r,
     const Closure& closure, const Wrapped& w,
     typename Wrapped::value_type& result) {
-  metal_nested_reduce<false>(r.member, w, result,
-                             r.member.impl_vector_length(), [&](auto& v) {
-                        for (iType i = r.start + r.member.team_rank();
-                             i < r.end; i += r.member.team_size())
-                          closure(i, v);
-                      });
+  metal_nested_reduce<false>(r.member, w, result, r.member.impl_vector_length(),
+                             [&](auto& v) {
+                               for (iType i = r.start + r.member.team_rank();
+                                    i < r.end; i += r.member.team_size())
+                                 closure(i, v);
+                             });
 }
 
 template <typename iType, class Closure, class Wrapped>
